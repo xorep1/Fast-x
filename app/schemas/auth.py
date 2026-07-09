@@ -52,6 +52,16 @@ class VerifyOTPRequest(BaseModel):
     @classmethod
     def validate_phone(cls, v: str) -> str:
         return _normalize_phone(v)
+    
+class Verifypass(BaseModel):
+    phone: str
+    code: str = Field(..., min_length=4, max_length=8)
+    new_password: str = Field(..., min_length=4, max_length=12)
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        return _normalize_phone(v)
 
 
 class ResendOTPRequest(BaseModel):

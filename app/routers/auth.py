@@ -40,6 +40,7 @@ from app.schemas.auth import (
     UpdateProfileRequest,
     UserResponse,
     VerifyOTPRequest,
+    Verifypass,
 )
 from app.services import bans as ban_service
 from app.services import otp as otp_service
@@ -118,19 +119,21 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         message="OTP sent. Verify it to complete registration.",
         debug_otp=code if settings.debug else None,
     )
+    
 
 
 @router.post("/verify-otp", response_model=TokenResponse)
 def verify_otp(data: VerifyOTPRequest, request: Request, db: Session = Depends(get_db)):
-    pending = otp_service.get_pending_registration(data.phone)
-    if not pending:
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-                            "No pending registration. Please register again.")
 
     ok, msg = otp_service.verify_code(data.phone, data.code)
     if not ok:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, msg)
 
+    pending = otp_service.get_pending_registration(data.phone)
+    if not pending:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            "No pending registration. Please register again.")
+        
     if db.scalar(select(User).where(
         or_(User.username == pending["username"], User.phone == pending["phone"]))
     ):
@@ -161,8 +164,48 @@ def resend_otp(data: ResendOTPRequest):
                             f"Please wait {remaining}s before resending")
     code = otp_service.regenerate_code(data.phone)
     print(f"[OTP-RESEND] phone={data.phone} code={code}")
-    return MessageResponse(message="OTP resent.",
+    return MessageResponse(message="OTP sent.",
                            debug_otp=code if settings.debug else None)
+    
+@router.post("/forgot-send", response_model=MessageResponse)
+def forgot_otp(data: ResendOTPRequest , db: Session = Depends(get_db)):
+    remaining = otp_service.is_on_cooldown(data.phone)
+    if remaining:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                            f"Please wait {remaining}s before resending")
+    existing = db.scalar(
+        select(User).where(
+            (User.phone == data.phone)
+        )
+    )
+    if not existing:
+        raise HTTPException(status.HTTP_409_CONFLICT, "User not exist")
+    
+    code = otp_service.regenerate_code(data.phone)
+    print(f"[OTP-RESEND] phone={data.phone} code={code}")
+    return MessageResponse(message="OTP sent.",
+                           debug_otp=code if settings.debug else None)
+    
+@router.post("/forgot-verify", response_model=MessageResponse)
+def verify_otp(data: Verifypass, request: Request, db: Session = Depends(get_db)):
+    
+    ok, msg = otp_service.verify_code(data.phone, data.code)
+    if not ok:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, msg)
+    
+    current_user: User = db.scalar(select(User).where(User.phone == data.phone))
+    
+    if verify_password(data.new_password, current_user.hashed_password):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "New password must be different from the current one")
+
+    current_user.hashed_password = hash_password(data.new_password)
+    db.add(current_user)
+    db.commit()
+    # Security: invalidate every existing session after a password change.
+    token_service.revoke_all(current_user.id)
+    return MessageResponse(message="Password changed. Please log in again.")
+        
 
 
 # ---------- login ----------
@@ -173,13 +216,15 @@ def login_phone(data: LoginPhoneRequest, request: Request, db: Session = Depends
     if remaining:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
                             f"Please wait {remaining}s before resending")  
-    otp_service.set_on_cooldown(data.phone)
     
     user = db.scalar(select(User).where(User.phone == data.phone))
     if not user or not verify_password(data.password, user.hashed_password):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid phone or password")
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Account disabled")
+    
+    otp_service.set_on_cooldown(data.phone)
+    
     enforce_not_banned(user.id)
     return _issue_tokens(user, request)
 
@@ -192,13 +237,15 @@ def login_username(data: LoginUsernameRequest, request: Request, db: Session = D
     if remaining:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
                             f"Please wait {remaining}s before resending")  
-    otp_service.set_on_cooldown(phone)
     
     user = db.scalar(select(User).where(User.username == data.username))
     if not user or not verify_password(data.password, user.hashed_password):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid username or password")
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Account disabled")
+    
+    otp_service.set_on_cooldown(phone)
+    
     enforce_not_banned(user.id)
     return _issue_tokens(user, request)
 
